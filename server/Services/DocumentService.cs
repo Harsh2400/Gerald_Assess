@@ -1,47 +1,50 @@
-using System.Text.Json;
-using Microsoft.EntityFrameworkCore;
-using RagKnowledgeService.Data;
 using RagKnowledgeService.Data.Entities;
 using RagKnowledgeService.Models;
+using RagKnowledgeService.Repositories;
 
 namespace RagKnowledgeService.Services;
 
-// Owns document/chunk persistence and the ingestion pipeline (chunk -> embed ->
-// store). Every write refreshes ISearchIndexService so retrieval sees it
+// Owns the document ingestion pipeline (chunk -> embed -> store) and maps
+// entities to API DTOs. Data access itself lives in IDocumentRepository;
+// SQLite (via the repository) is the source of truth for text/metadata,
+// Qdrant holds the vectors keyed by chunk ID. Every write refreshes
+// ISearchIndexService (BM25 + in-memory chunk metadata) so retrieval sees it
 // immediately - fine at this corpus size; see README for what replaces the
 // full-rebuild-on-write approach at larger scale.
 public class DocumentService : IDocumentService
 {
-    private readonly AppDbContext _db;
+    private readonly IDocumentRepository _documentRepository;
+    private readonly IChunkRepository _chunkRepository;
     private readonly IEmbeddingService _embeddingService;
+    private readonly IVectorStore _vectorStore;
     private readonly ISearchIndexService _searchIndex;
     private readonly ILogger<DocumentService> _logger;
 
     public DocumentService(
-        AppDbContext db,
+        IDocumentRepository documentRepository,
+        IChunkRepository chunkRepository,
         IEmbeddingService embeddingService,
+        IVectorStore vectorStore,
         ISearchIndexService searchIndex,
         ILogger<DocumentService> logger)
     {
-        _db = db;
+        _documentRepository = documentRepository;
+        _chunkRepository = chunkRepository;
         _embeddingService = embeddingService;
+        _vectorStore = vectorStore;
         _searchIndex = searchIndex;
         _logger = logger;
     }
 
     public async Task<List<DocumentSummary>> ListAsync()
     {
-        return await _db.Documents.AsNoTracking()
-            .OrderByDescending(d => d.UpdatedAt)
-            .Select(d => ToSummary(d, d.Chunks.Count))
-            .ToListAsync();
+        var docs = await _documentRepository.GetAllAsync();
+        return docs.Select(d => ToSummary(d, d.Chunks.Count)).ToList();
     }
 
     public async Task<DocumentDetail?> GetAsync(string id)
     {
-        var doc = await _db.Documents.AsNoTracking()
-            .Include(d => d.Chunks)
-            .FirstOrDefaultAsync(d => d.Id == id);
+        var doc = await _documentRepository.GetByIdAsync(id, includeChunks: true);
         return doc is null ? null : ToDetail(doc);
     }
 
@@ -49,10 +52,10 @@ public class DocumentService : IDocumentService
     {
         var normalized = MarkdownChunker.Normalize(content);
         var doc = new DocumentEntity { Title = title, Content = normalized, SourceType = sourceType };
-        doc.Chunks = BuildChunks(doc.Id, normalized);
+        doc.Chunks = await BuildChunksAsync(doc.Id, normalized);
 
-        _db.Documents.Add(doc);
-        await _db.SaveChangesAsync();
+        _documentRepository.Add(doc);
+        await _documentRepository.SaveChangesAsync();
         await _searchIndex.RefreshAsync();
 
         return ToDetail(doc);
@@ -60,7 +63,7 @@ public class DocumentService : IDocumentService
 
     public async Task<DocumentDetail?> UpdateAsync(string id, string title, string content)
     {
-        var doc = await _db.Documents.Include(d => d.Chunks).FirstOrDefaultAsync(d => d.Id == id);
+        var doc = await _documentRepository.GetByIdAsync(id, includeChunks: true);
         if (doc is null) return null;
 
         var normalized = MarkdownChunker.Normalize(content);
@@ -68,10 +71,12 @@ public class DocumentService : IDocumentService
         doc.Content = normalized;
         doc.UpdatedAt = DateTime.UtcNow;
 
-        _db.Chunks.RemoveRange(doc.Chunks);
-        doc.Chunks = BuildChunks(doc.Id, normalized);
+        _chunkRepository.RemoveRange(doc.Chunks.ToList());
+        doc.Chunks.Clear();
+        await _vectorStore.DeleteByDocumentIdAsync(doc.Id);
+        doc.Chunks = await BuildChunksAsync(doc.Id, normalized);
 
-        await _db.SaveChangesAsync();
+        await _documentRepository.SaveChangesAsync();
         await _searchIndex.RefreshAsync();
 
         return ToDetail(doc);
@@ -79,18 +84,19 @@ public class DocumentService : IDocumentService
 
     public async Task<bool> DeleteAsync(string id)
     {
-        var doc = await _db.Documents.FirstOrDefaultAsync(d => d.Id == id);
+        var doc = await _documentRepository.GetByIdAsync(id);
         if (doc is null) return false;
 
-        _db.Documents.Remove(doc); // cascades to chunks
-        await _db.SaveChangesAsync();
+        _documentRepository.Remove(doc); // cascades to chunks in SQLite
+        await _documentRepository.SaveChangesAsync();
+        await _vectorStore.DeleteByDocumentIdAsync(id);
         await _searchIndex.RefreshAsync();
         return true;
     }
 
     public async Task<int> SeedFromFolderIfEmptyAsync(string folderPath)
     {
-        if (await _db.Documents.AnyAsync())
+        if (await _documentRepository.AnyAsync())
         {
             await _searchIndex.RefreshAsync();
             return 0;
@@ -105,7 +111,8 @@ public class DocumentService : IDocumentService
         var files = Directory.GetFiles(folderPath)
             .Where(f => f.EndsWith(".md", StringComparison.OrdinalIgnoreCase)
                      || f.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
-            .OrderBy(f => f);
+            .OrderBy(f => f)
+            .ToList();
 
         var count = 0;
         foreach (var filePath in files)
@@ -116,19 +123,22 @@ public class DocumentService : IDocumentService
             var title = parsed.Title != "Untitled" ? parsed.Title : Path.GetFileNameWithoutExtension(filePath);
 
             var doc = new DocumentEntity { Title = title, Content = normalized, SourceType = "folder-seed" };
-            doc.Chunks = BuildChunks(doc.Id, normalized);
-            _db.Documents.Add(doc);
+            doc.Chunks = await BuildChunksAsync(doc.Id, normalized);
+            _documentRepository.Add(doc);
             count++;
+
+            _logger.LogInformation("Seeded document {Index}/{Total}: {Title} ({ChunkCount} chunks).",
+                count, files.Count, title, doc.Chunks.Count);
         }
 
-        await _db.SaveChangesAsync();
+        await _documentRepository.SaveChangesAsync();
         await _searchIndex.RefreshAsync();
 
         _logger.LogInformation("Seeded {DocCount} documents from {FolderPath}.", count, folderPath);
         return count;
     }
 
-    private List<ChunkEntity> BuildChunks(string documentId, string normalizedContent)
+    private async Task<List<ChunkEntity>> BuildChunksAsync(string documentId, string normalizedContent)
     {
         var parsed = MarkdownChunker.Parse(normalizedContent);
         var entities = new List<ChunkEntity>();
@@ -139,18 +149,20 @@ public class DocumentService : IDocumentService
             foreach (var piece in MarkdownChunker.SplitLongSection(section.Body))
             {
                 var chunkText = $"{parsed.Title} — {section.Heading}\n{piece.Text}";
-                var embedding = _embeddingService.Embed(chunkText);
+                var embedding = await _embeddingService.EmbedAsync(chunkText);
 
-                entities.Add(new ChunkEntity
+                var chunk = new ChunkEntity
                 {
                     DocumentId = documentId,
                     ChunkIndex = index,
                     Heading = section.Heading,
                     Text = chunkText,
                     StartChar = section.StartChar + piece.StartChar,
-                    EndChar = section.StartChar + piece.EndChar,
-                    EmbeddingJson = JsonSerializer.Serialize(embedding)
-                });
+                    EndChar = section.StartChar + piece.EndChar
+                };
+
+                await _vectorStore.UpsertAsync(chunk.Id, documentId, embedding);
+                entities.Add(chunk);
                 index++;
             }
         }

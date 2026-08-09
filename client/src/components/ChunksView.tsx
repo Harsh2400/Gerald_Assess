@@ -65,12 +65,14 @@ export function ChunksView({
       <div className="manager-view-inner">
         <div className="manager-header">
           <div>
-            <h2>Chunks</h2>
-            <p>The indexed units retrieval actually searches over. Editing re-embeds just this chunk.</p>
+            <span className="eyebrow">Knowledge base</span>
+            <h2>Indexed chunks</h2>
+            <p>Inspect and refine the searchable passages behind every answer.</p>
           </div>
         </div>
 
-        <div className="filter-row">
+        <div className="content-toolbar chunk-toolbar">
+          <div><span>Home</span><b>›</b><strong>Indexed chunks</strong></div>
           <select
             className="text-input"
             style={{ maxWidth: 320 }}
@@ -93,7 +95,7 @@ export function ChunksView({
         ) : chunks.length === 0 ? (
           <div className="empty-state">No chunks found.</div>
         ) : (
-          <table className="data-table">
+          <div className="table-card"><table className="data-table">
             <thead>
               <tr>
                 <th>Document</th>
@@ -106,7 +108,7 @@ export function ChunksView({
             <tbody>
               {chunks.map((c) => (
                 <tr key={c.id}>
-                  <td className="row-title">{docTitleById[c.documentId] ?? c.documentId}</td>
+                  <td className="row-title"><span className="file-icon chunk-icon">#</span><span>{docTitleById[c.documentId] ?? c.documentId}</span></td>
                   <td>{c.heading}</td>
                   <td className="chunk-text-preview">
                     {c.text.length > 160 ? c.text.slice(0, 160) + '...' : c.text}
@@ -133,7 +135,7 @@ export function ChunksView({
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         )}
       </div>
 

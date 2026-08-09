@@ -1,7 +1,5 @@
-using System.Text.Json;
-using Microsoft.EntityFrameworkCore;
-using RagKnowledgeService.Data;
 using RagKnowledgeService.Models;
+using RagKnowledgeService.Repositories;
 
 namespace RagKnowledgeService.Services;
 
@@ -11,49 +9,49 @@ namespace RagKnowledgeService.Services;
 // document content, which is worse than admitting we no longer know.
 public class ChunkService : IChunkService
 {
-    private readonly AppDbContext _db;
+    private readonly IChunkRepository _chunkRepository;
     private readonly IEmbeddingService _embeddingService;
+    private readonly IVectorStore _vectorStore;
     private readonly ISearchIndexService _searchIndex;
 
-    public ChunkService(AppDbContext db, IEmbeddingService embeddingService, ISearchIndexService searchIndex)
+    public ChunkService(
+        IChunkRepository chunkRepository,
+        IEmbeddingService embeddingService,
+        IVectorStore vectorStore,
+        ISearchIndexService searchIndex)
     {
-        _db = db;
+        _chunkRepository = chunkRepository;
         _embeddingService = embeddingService;
+        _vectorStore = vectorStore;
         _searchIndex = searchIndex;
     }
 
     public async Task<List<ChunkSummary>> ListAsync(string? documentId)
     {
-        var query = _db.Chunks.AsNoTracking().AsQueryable();
-        if (!string.IsNullOrWhiteSpace(documentId))
-        {
-            query = query.Where(c => c.DocumentId == documentId);
-        }
-
-        return await query
-            .OrderBy(c => c.DocumentId).ThenBy(c => c.ChunkIndex)
-            .Select(c => ToSummary(c))
-            .ToListAsync();
+        var chunks = await _chunkRepository.ListAsync(documentId);
+        return chunks.Select(ToSummary).ToList();
     }
 
     public async Task<ChunkSummary?> GetAsync(string id)
     {
-        var chunk = await _db.Chunks.AsNoTracking().FirstOrDefaultAsync(c => c.Id == id);
+        var chunk = await _chunkRepository.GetByIdAsync(id);
         return chunk is null ? null : ToSummary(chunk);
     }
 
     public async Task<ChunkSummary?> UpdateTextAsync(string id, string text)
     {
-        var chunk = await _db.Chunks.FirstOrDefaultAsync(c => c.Id == id);
+        var chunk = await _chunkRepository.GetByIdAsync(id);
         if (chunk is null) return null;
 
+        var embedding = await _embeddingService.EmbedAsync(text);
+
         chunk.Text = text;
-        chunk.EmbeddingJson = JsonSerializer.Serialize(_embeddingService.Embed(text));
         chunk.StartChar = -1;
         chunk.EndChar = -1;
         chunk.UpdatedAt = DateTime.UtcNow;
 
-        await _db.SaveChangesAsync();
+        await _chunkRepository.SaveChangesAsync();
+        await _vectorStore.UpsertAsync(chunk.Id, chunk.DocumentId, embedding);
         await _searchIndex.RefreshAsync();
 
         return ToSummary(chunk);
@@ -61,11 +59,12 @@ public class ChunkService : IChunkService
 
     public async Task<bool> DeleteAsync(string id)
     {
-        var chunk = await _db.Chunks.FirstOrDefaultAsync(c => c.Id == id);
+        var chunk = await _chunkRepository.GetByIdAsync(id);
         if (chunk is null) return false;
 
-        _db.Chunks.Remove(chunk);
-        await _db.SaveChangesAsync();
+        _chunkRepository.Remove(chunk);
+        await _chunkRepository.SaveChangesAsync();
+        await _vectorStore.DeleteAsync(id);
         await _searchIndex.RefreshAsync();
         return true;
     }

@@ -4,7 +4,10 @@ namespace RagKnowledgeService.Services;
 
 // Orchestrates hybrid retrieval -> confidence gate -> generation. Used
 // statelessly by AskController and, with conversation persistence layered on
-// top, by ChatController - both hit the same underlying pipeline.
+// top, by ChatController - both hit the same underlying pipeline. The LLM is
+// only called once retrieval already clears the confidence bar, so a weak
+// match never reaches gemma3 to be rationalized into a plausible-sounding
+// answer - the gate is on retrieval quality, not on how the model feels about it.
 public class RagQueryService : IRagQueryService
 {
     // Rerank score below this means "nothing in the corpus is really
@@ -20,9 +23,9 @@ public class RagQueryService : IRagQueryService
         _llmService = llmService;
     }
 
-    public AskResponse Answer(string question, int topK)
+    public async Task<AskResponse> AnswerAsync(string question, int topK, CancellationToken ct = default)
     {
-        var results = _retrievalService.Retrieve(question, topK);
+        var results = await _retrievalService.RetrieveAsync(question, topK, ct);
         var topScore = results.Count > 0 ? results[0].RerankScore : 0.0;
         var noConfidentAnswer = results.Count == 0 || topScore < ConfidenceThreshold;
 
@@ -39,7 +42,7 @@ public class RagQueryService : IRagQueryService
         }
 
         var contextChunks = results.Select(r => r.Chunk).ToList();
-        var answer = _llmService.GenerateAnswer(question, contextChunks);
+        var answer = await _llmService.GenerateAnswerAsync(question, contextChunks, ct);
 
         var citations = results.Select(r => new Citation
         {

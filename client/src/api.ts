@@ -8,12 +8,13 @@ import type {
   DocumentSummary,
 } from './types';
 
-const API_BASE = 'http://localhost:5252/api';
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const isFormData = init?.body instanceof FormData;
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    headers: { ...(isFormData ? {} : { 'Content-Type': 'application/json' }), ...init?.headers },
   });
   if (!res.ok) {
     let detail = '';
@@ -50,6 +51,12 @@ export const api = {
 
   createDocument: (title: string, content: string) =>
     request<DocumentDetail>('/documents', { method: 'POST', body: JSON.stringify({ title, content }) }),
+
+  uploadDocument: (file: File) => {
+    const body = new FormData();
+    body.append('file', file);
+    return request<DocumentDetail>('/documents/upload', { method: 'POST', body });
+  },
 
   updateDocument: (id: string, title: string, content: string) =>
     request<DocumentDetail>(`/documents/${id}`, { method: 'PUT', body: JSON.stringify({ title, content }) }),

@@ -1,0 +1,54 @@
+name: gerald-rag
+
+services:
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    image: gerald-rag-client:local
+    ports:
+      - "${GERALD_PORT:-3000}:80"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: gerald-rag-server:local
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_HTTP_PORTS: 8080
+      DatabasePath: /data/rag.db
+      SeedFolderPath: /app/docs
+      Ollama__BaseUrl: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      Ollama__EmbeddingModel: nomic-embed-text:v1.5
+      Ollama__EmbeddingDimensions: 768
+      Ollama__ChatModel: gemma3
+      Qdrant__Host: qdrant
+      Qdrant__GrpcPort: 6334
+      Qdrant__CollectionName: gerald_chunks
+    ports:
+      - "${GERALD_API_PORT:-5252}:8080"
+    volumes:
+      - gerald_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  gerald_data:
+  qdrant_data:

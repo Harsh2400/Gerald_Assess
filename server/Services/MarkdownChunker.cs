@@ -17,6 +17,8 @@ public static class MarkdownChunker
 {
     private const int MaxWordsPerChunk = 120;
     private const int OverlapWords = 20;
+    private const int FallbackCharsPerChunk = 900;
+    private const int FallbackOverlapChars = 120;
 
     // Callers should store DocumentEntity.Content as this normalized form so
     // offsets computed here stay valid when the document is re-read later.
@@ -81,6 +83,22 @@ public static class MarkdownChunker
         var words = Regex.Matches(body, @"\S+")
             .Select(m => (Text: m.Value, Index: m.Index))
             .ToList();
+
+        // Some PDF producers expose glyphs without reliable whitespace. Never
+        // allow a book/paper-sized body to become one enormous chunk: use a
+        // bounded character window as a last-resort safety net.
+        if (words.Count <= 1 && body.Length > FallbackCharsPerChunk)
+        {
+            var fallbackPieces = new List<ChunkPiece>();
+            var fallbackStep = FallbackCharsPerChunk - FallbackOverlapChars;
+            for (var start = 0; start < body.Length; start += fallbackStep)
+            {
+                var end = Math.Min(start + FallbackCharsPerChunk, body.Length);
+                fallbackPieces.Add(new ChunkPiece(body[start..end], start, end));
+                if (end == body.Length) break;
+            }
+            return fallbackPieces;
+        }
 
         if (words.Count <= MaxWordsPerChunk)
         {

@@ -4,5 +4,5 @@ namespace RagKnowledgeService.Services;
 
 public interface IRagQueryService
 {
-    AskResponse Answer(string question, int topK);
+    Task<AskResponse> AnswerAsync(string question, int topK, CancellationToken ct = default);
 }

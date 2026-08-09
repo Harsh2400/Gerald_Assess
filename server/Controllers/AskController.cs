@@ -18,7 +18,7 @@ public class AskController : ControllerBase
     // POST /api/ask { "question": "...", "topK": 3 } - stateless one-shot Q&A,
     // no conversation persisted. Use /api/chat for a persisted conversation.
     [HttpPost]
-    public ActionResult<AskResponse> Ask([FromBody] AskRequest request)
+    public async Task<ActionResult<AskResponse>> Ask([FromBody] AskRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.Question))
         {
@@ -26,7 +26,7 @@ public class AskController : ControllerBase
         }
 
         var topK = request.TopK is > 0 and <= 10 ? request.TopK : 3;
-        var response = _ragQueryService.Answer(request.Question.Trim(), topK);
+        var response = await _ragQueryService.AnswerAsync(request.Question.Trim(), topK);
         return Ok(response);
     }
 }

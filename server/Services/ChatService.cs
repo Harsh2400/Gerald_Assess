@@ -1,8 +1,7 @@
 using System.Text.Json;
-using Microsoft.EntityFrameworkCore;
-using RagKnowledgeService.Data;
 using RagKnowledgeService.Data.Entities;
 using RagKnowledgeService.Models;
+using RagKnowledgeService.Repositories;
 
 namespace RagKnowledgeService.Services;
 
@@ -13,30 +12,28 @@ namespace RagKnowledgeService.Services;
 // independently) - see README for what that would take.
 public class ChatService : IChatService
 {
-    private readonly AppDbContext _db;
+    private readonly IConversationRepository _conversationRepository;
     private readonly IRagQueryService _ragQueryService;
 
-    public ChatService(AppDbContext db, IRagQueryService ragQueryService)
+    public ChatService(IConversationRepository conversationRepository, IRagQueryService ragQueryService)
     {
-        _db = db;
+        _conversationRepository = conversationRepository;
         _ragQueryService = ragQueryService;
     }
 
     public async Task<List<ConversationSummary>> ListConversationsAsync()
     {
-        return await _db.Conversations.AsNoTracking()
-            .OrderByDescending(c => c.CreatedAt)
-            .Select(c => new ConversationSummary
-            {
-                Id = c.Id,
-                CreatedAt = c.CreatedAt,
-                MessageCount = c.Messages.Count,
-                LastMessagePreview = c.Messages
-                    .OrderByDescending(m => m.Sequence)
-                    .Select(m => m.Content)
-                    .FirstOrDefault()
-            })
-            .ToListAsync();
+        var conversations = await _conversationRepository.GetAllWithMessagesAsync();
+        return conversations.Select(c => new ConversationSummary
+        {
+            Id = c.Id,
+            CreatedAt = c.CreatedAt,
+            MessageCount = c.Messages.Count,
+            LastMessagePreview = c.Messages
+                .OrderByDescending(m => m.Sequence)
+                .Select(m => m.Content)
+                .FirstOrDefault()
+        }).ToList();
     }
 
     public async Task<ChatResponse?> SendMessageAsync(string? conversationId, string message, int topK)
@@ -44,31 +41,28 @@ public class ChatService : IChatService
         ConversationEntity? conversation = null;
         if (!string.IsNullOrWhiteSpace(conversationId))
         {
-            conversation = await _db.Conversations.FirstOrDefaultAsync(c => c.Id == conversationId);
+            conversation = await _conversationRepository.GetByIdAsync(conversationId);
             if (conversation is null) return null;
         }
 
         if (conversation is null)
         {
             conversation = new ConversationEntity();
-            _db.Conversations.Add(conversation);
+            _conversationRepository.AddConversation(conversation);
         }
 
-        var nextSequence = await _db.ChatMessages
-            .Where(m => m.ConversationId == conversation.Id)
-            .Select(m => (int?)m.Sequence)
-            .MaxAsync() ?? -1;
+        var nextSequence = await _conversationRepository.GetNextSequenceAsync(conversation.Id);
 
         var userMessage = new ChatMessageEntity
         {
             ConversationId = conversation.Id,
             Role = "user",
             Content = message,
-            Sequence = nextSequence + 1
+            Sequence = nextSequence
         };
-        _db.ChatMessages.Add(userMessage);
+        _conversationRepository.AddMessage(userMessage);
 
-        var answer = _ragQueryService.Answer(message, topK);
+        var answer = await _ragQueryService.AnswerAsync(message, topK);
 
         var assistantMessage = new ChatMessageEntity
         {
@@ -78,11 +72,11 @@ public class ChatService : IChatService
             CitationsJson = JsonSerializer.Serialize(answer.Citations),
             Confidence = answer.Confidence,
             NoConfidentAnswer = answer.NoConfidentAnswer,
-            Sequence = nextSequence + 2
+            Sequence = nextSequence + 1
         };
-        _db.ChatMessages.Add(assistantMessage);
+        _conversationRepository.AddMessage(assistantMessage);
 
-        await _db.SaveChangesAsync();
+        await _conversationRepository.SaveChangesAsync();
 
         return new ChatResponse
         {
@@ -94,14 +88,10 @@ public class ChatService : IChatService
 
     public async Task<List<ChatMessageDto>?> GetHistoryAsync(string conversationId)
     {
-        var exists = await _db.Conversations.AnyAsync(c => c.Id == conversationId);
+        var exists = await _conversationRepository.ExistsAsync(conversationId);
         if (!exists) return null;
 
-        var messages = await _db.ChatMessages.AsNoTracking()
-            .Where(m => m.ConversationId == conversationId)
-            .OrderBy(m => m.Sequence)
-            .ToListAsync();
-
+        var messages = await _conversationRepository.GetMessagesAsync(conversationId);
         return messages.Select(ToDto).ToList();
     }
 

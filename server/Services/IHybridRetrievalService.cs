@@ -2,5 +2,5 @@ namespace RagKnowledgeService.Services;
 
 public interface IHybridRetrievalService
 {
-    List<RankedResult> Retrieve(string query, int topK);
+    Task<List<RankedResult>> RetrieveAsync(string query, int topK, CancellationToken ct = default);
 }

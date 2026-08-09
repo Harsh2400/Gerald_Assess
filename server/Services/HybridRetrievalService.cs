@@ -1,13 +1,12 @@
-using RagKnowledgeService.Models;
-
 namespace RagKnowledgeService.Services;
 
-// Standard hybrid-search pipeline: run BM25 (keyword) and semantic (vector)
-// search independently, fuse their rankings with Reciprocal Rank Fusion, then
-// rerank the fused candidate set. RRF is what Elasticsearch/Azure AI
-// Search/Weaviate use to combine hybrid results - it works on ranks, not raw
-// scores, which sidesteps the fact that BM25 and cosine similarity live on
-// completely different scales and can't be averaged directly.
+// Standard hybrid-search pipeline: run BM25 (keyword, in-process over SQLite-
+// backed chunk text) and semantic (Qdrant ANN search over Ollama embeddings)
+// independently, fuse their rankings with Reciprocal Rank Fusion, then rerank
+// the fused candidate set. RRF is what Elasticsearch/Azure AI Search/Weaviate
+// use to combine hybrid results - it works on ranks, not raw scores, which
+// sidesteps the fact that BM25 and cosine similarity live on completely
+// different scales and can't be averaged directly.
 public class HybridRetrievalService : IHybridRetrievalService
 {
     private const int CandidatePoolSize = 20;
@@ -15,19 +14,22 @@ public class HybridRetrievalService : IHybridRetrievalService
 
     private readonly ISearchIndexService _searchIndex;
     private readonly IEmbeddingService _embeddingService;
+    private readonly IVectorStore _vectorStore;
     private readonly IRerankerService _reranker;
 
     public HybridRetrievalService(
         ISearchIndexService searchIndex,
         IEmbeddingService embeddingService,
+        IVectorStore vectorStore,
         IRerankerService reranker)
     {
         _searchIndex = searchIndex;
         _embeddingService = embeddingService;
+        _vectorStore = vectorStore;
         _reranker = reranker;
     }
 
-    public List<RankedResult> Retrieve(string query, int topK)
+    public async Task<List<RankedResult>> RetrieveAsync(string query, int topK, CancellationToken ct = default)
     {
         var allChunks = _searchIndex.GetAllChunks();
         if (allChunks.Count == 0) return new List<RankedResult>();
@@ -40,17 +42,14 @@ public class HybridRetrievalService : IHybridRetrievalService
             .Select((kv, rank) => (ChunkId: kv.Key, Score: kv.Value, Rank: rank))
             .ToList();
 
-        // --- Semantic search (cosine similarity over embeddings) ---
-        var queryEmbedding = _embeddingService.Embed(query);
-        var semanticRanked = allChunks
-            .Select(c => (Chunk: c, Score: CosineSimilarity(queryEmbedding, c.Embedding)))
-            .OrderByDescending(x => x.Score)
-            .Take(CandidatePoolSize)
-            .Select((x, rank) => (ChunkId: x.Chunk.Id, Chunk: x.Chunk, Score: x.Score, Rank: rank))
+        // --- Semantic search (Qdrant ANN over Ollama embeddings) ---
+        var queryEmbedding = await _embeddingService.EmbedAsync(query, ct);
+        var semanticHits = await _vectorStore.SearchAsync(queryEmbedding, CandidatePoolSize, ct);
+        var semanticRanked = semanticHits
+            .Select((hit, rank) => (hit.ChunkId, hit.Score, Rank: rank))
             .ToList();
 
         // --- Reciprocal Rank Fusion ---
-        var chunksById = allChunks.ToDictionary(c => c.Id);
         var bm25RawById = bm25Ranked.ToDictionary(x => x.ChunkId, x => x.Score);
         var semanticRawById = semanticRanked.ToDictionary(x => x.ChunkId, x => x.Score);
 
@@ -59,7 +58,7 @@ public class HybridRetrievalService : IHybridRetrievalService
         {
             fusedScores[chunkId] = fusedScores.GetValueOrDefault(chunkId) + 1.0 / (RrfK + rank + 1);
         }
-        foreach (var (chunkId, _, _, rank) in semanticRanked)
+        foreach (var (chunkId, _, rank) in semanticRanked)
         {
             fusedScores[chunkId] = fusedScores.GetValueOrDefault(chunkId) + 1.0 / (RrfK + rank + 1);
         }
@@ -73,28 +72,16 @@ public class HybridRetrievalService : IHybridRetrievalService
         var maxPossibleFused = 2.0 / (RrfK + 1);
 
         var candidates = fusedScores.Keys
-            .Where(chunksById.ContainsKey)
-            .Select(id => new RerankCandidate(
-                chunksById[id],
-                Math.Min(1.0, fusedScores[id] / maxPossibleFused),
-                bm25RawById.GetValueOrDefault(id),
-                semanticRawById.GetValueOrDefault(id)))
+            .Select(id => (Id: id, Chunk: _searchIndex.GetChunkById(id)))
+            .Where(x => x.Chunk is not null)
+            .Select(x => new RerankCandidate(
+                x.Chunk!,
+                Math.Min(1.0, fusedScores[x.Id] / maxPossibleFused),
+                bm25RawById.GetValueOrDefault(x.Id),
+                semanticRawById.GetValueOrDefault(x.Id)))
             .ToList();
 
         // --- Rerank the fused candidate set ---
         return _reranker.Rerank(query, candidates).Take(topK).ToList();
-    }
-
-    private static double CosineSimilarity(float[] a, float[] b)
-    {
-        double dot = 0, magA = 0, magB = 0;
-        for (var i = 0; i < a.Length; i++)
-        {
-            dot += a[i] * b[i];
-            magA += a[i] * a[i];
-            magB += b[i] * b[i];
-        }
-        if (magA < 1e-8 || magB < 1e-8) return 0;
-        return dot / (Math.Sqrt(magA) * Math.Sqrt(magB));
     }
 }
