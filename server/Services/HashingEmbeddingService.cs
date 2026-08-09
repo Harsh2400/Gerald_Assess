@@ -1,5 +1,3 @@
-using System.Text.RegularExpressions;
-
 namespace RagKnowledgeService.Services;
 
 // Deterministic stand-in for a real embedding model: a normalized hashed
@@ -10,18 +8,11 @@ public class HashingEmbeddingService : IEmbeddingService
 {
     public int Dimensions => 2048;
 
-    private static readonly HashSet<string> StopWords = new(new[]
-    {
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are",
-        "was", "were", "be", "been", "with", "as", "at", "by", "from", "this",
-        "that", "it", "its", "can", "will", "your", "you", "their", "has", "have"
-    });
-
     public float[] Embed(string text)
     {
         var vector = new float[Dimensions];
 
-        foreach (var token in Tokenize(text))
+        foreach (var token in Tokenizer.Tokenize(text))
         {
             var hash = Fnv1aHash(token);
             var index = (int)(hash % (uint)Dimensions);
@@ -32,11 +23,6 @@ public class HashingEmbeddingService : IEmbeddingService
         Normalize(vector);
         return vector;
     }
-
-    private static IEnumerable<string> Tokenize(string text) =>
-        Regex.Matches(text.ToLowerInvariant(), "[a-z0-9]+")
-            .Select(m => m.Value)
-            .Where(w => w.Length > 2 && !StopWords.Contains(w));
 
     private static uint Fnv1aHash(string token)
     {

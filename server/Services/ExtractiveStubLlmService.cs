@@ -17,13 +17,18 @@ public class ExtractiveStubLlmService : ILlmService
         }
 
         var best = contextChunks[0];
-        var sentence = PickMostRelevantSentence(question, best.Text);
+        // Chunk.Text is "{DocTitle} — {Heading}\n{body}" (see DocumentService.BuildChunks).
+        // Score sentences from the body only - otherwise title/heading keywords
+        // (e.g. "Offline" in a heading) leak into the first sentence's score and
+        // can outrank a later sentence that's actually more relevant.
+        var body = best.Text.Contains('\n') ? best.Text[(best.Text.IndexOf('\n') + 1)..] : best.Text;
+        var sentence = PickMostRelevantSentence(question, body);
         return $"{sentence} (from \"{best.DocTitle}\")";
     }
 
     private static string PickMostRelevantSentence(string question, string text)
     {
-        var questionWords = Tokenize(question).ToHashSet();
+        var questionWords = Tokenizer.Tokenize(question).ToHashSet();
         var sentences = Regex.Split(text, @"(?<=[.!?])\s+")
             .Where(s => !string.IsNullOrWhiteSpace(s))
             .ToList();
@@ -31,11 +36,8 @@ public class ExtractiveStubLlmService : ILlmService
         if (sentences.Count == 0) return text.Trim();
 
         return sentences
-            .OrderByDescending(s => Tokenize(s).Count(questionWords.Contains))
+            .OrderByDescending(s => Tokenizer.Tokenize(s).Count(questionWords.Contains))
             .First()
             .Trim();
     }
-
-    private static IEnumerable<string> Tokenize(string text) =>
-        Regex.Matches(text.ToLowerInvariant(), "[a-z0-9]+").Select(m => m.Value);
 }

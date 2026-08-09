@@ -1,6 +1,9 @@
 # .NET
 server/bin/
 server/obj/
+server/rag.db
+server/rag.db-shm
+server/rag.db-wal
 
 # Node
 client/node_modules/

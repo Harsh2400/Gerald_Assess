@@ -2,32 +2,28 @@ using RagKnowledgeService.Models;
 
 namespace RagKnowledgeService.Services;
 
-public interface IAskService
+// Orchestrates hybrid retrieval -> confidence gate -> generation. Used
+// statelessly by AskController and, with conversation persistence layered on
+// top, by ChatController - both hit the same underlying pipeline.
+public class RagQueryService : IRagQueryService
 {
-    AskResponse Ask(string question, int topK);
-}
-
-// Orchestrates retrieval -> confidence gate -> generation. Kept as its own
-// class so retrieval and generation stay independently testable/swappable.
-public class AskService : IAskService
-{
-    // Cosine similarity below this means "nothing in the corpus is really
+    // Rerank score below this means "nothing in the corpus is really
     // relevant" - tuned empirically against the sample docs, not a magic constant.
-    private const double ConfidenceThreshold = 0.18;
+    private const double ConfidenceThreshold = 0.35;
 
-    private readonly IRetrievalService _retrievalService;
+    private readonly IHybridRetrievalService _retrievalService;
     private readonly ILlmService _llmService;
 
-    public AskService(IRetrievalService retrievalService, ILlmService llmService)
+    public RagQueryService(IHybridRetrievalService retrievalService, ILlmService llmService)
     {
         _retrievalService = retrievalService;
         _llmService = llmService;
     }
 
-    public AskResponse Ask(string question, int topK)
+    public AskResponse Answer(string question, int topK)
     {
         var results = _retrievalService.Retrieve(question, topK);
-        var topScore = results.Count > 0 ? results[0].Score : 0.0;
+        var topScore = results.Count > 0 ? results[0].RerankScore : 0.0;
         var noConfidentAnswer = results.Count == 0 || topScore < ConfidenceThreshold;
 
         if (noConfidentAnswer)
@@ -49,8 +45,14 @@ public class AskService : IAskService
         {
             DocId = r.Chunk.DocId,
             DocTitle = r.Chunk.DocTitle,
-            Snippet = Truncate(r.Chunk.Text, 220),
-            Score = Math.Round(r.Score, 4)
+            ChunkId = r.Chunk.Id,
+            Heading = r.Chunk.Heading,
+            Snippet = Truncate(r.Chunk.Text, 260),
+            StartChar = r.Chunk.StartChar,
+            EndChar = r.Chunk.EndChar,
+            Bm25Score = Math.Round(r.Bm25Score, 4),
+            SemanticScore = Math.Round(r.SemanticScore, 4),
+            RerankScore = Math.Round(r.RerankScore, 4)
         }).ToList();
 
         return new AskResponse

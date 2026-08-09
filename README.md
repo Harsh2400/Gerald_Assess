@@ -1,209 +1,276 @@
-# Aurora Knowledge Assistant — RAG Knowledge Service
+# Aurora Knowledge Assistant — Hybrid RAG Knowledge Service
 
-A small RAG (retrieval-augmented generation) service: it ingests a folder of markdown
-knowledge articles, indexes them, and exposes an `/api/ask` endpoint that answers
-questions grounded in those docs with citations and a confidence signal.
+A RAG (retrieval-augmented generation) service with full document/chunk lifecycle
+management: ingest, chunk, index, retrieve (hybrid BM25 + semantic + rerank), answer
+with citations and confidence, and a chat interface to query and manage the
+knowledge base — all backed by persistent storage instead of an in-memory demo store.
 
-Sample dataset: five fictional support docs for a made-up product, "Aurora Cloud
-Storage" (`/docs`), covering pricing, security, API rate limits, support hours, and
-backup/recovery. No real company, customer, or personal data is used.
+Sample dataset: six fictional support docs for a made-up product, "Aurora Cloud
+Storage" (`/docs`, loaded on first run). No real company, customer, or personal data
+is used.
+
+> **Note on scope:** this project intentionally goes beyond a minimal take-home
+> scope — persistence, hybrid retrieval, reranking, and full CRUD were built out
+> deliberately, not because a smaller version wasn't possible. See
+> [Known limitations](#known-limitations) for an honest accounting of what's still a
+> stub versus production-real.
 
 ## Stack and why
 
-- **ASP.NET Core 8 Web API (C#)** for the backend — matches the suggested stack and
-  my day-to-day stack, so I could move fastest in the time box.
-- **React + Vite + TypeScript** for a thin client — a single page, no routing/state
-  library, since the brief explicitly allows a "thin client."
-- **No vector database.** Chunks and their embeddings live in an in-memory
-  `ConcurrentBag` populated once at startup. For a demo corpus of a few dozen
-  chunks, brute-force cosine similarity is simpler, faster to build, and just as
-  correct as standing up SQL Server's (very new/preview) vector type or an external
-  vector store — see [Scaling](#scaling-thoughts) for what replaces it in production.
-- **No LLM/embedding API key.** Both are stubbed behind interfaces (see below) so the
-  service is fully runnable offline and deterministically testable.
+- **ASP.NET Core 8 Web API (C#)** — matches my day-to-day stack.
+- **SQLite via EF Core** — real persistence (documents/chunks/conversations survive
+  restarts and support real CRUD) without standing up a database server. `Data
+  Source=rag.db` is a one-line swap to SQL Server/Postgres in `Program.cs`; nothing
+  above the `AppDbContext` layer would need to change.
+- **React + Vite + TypeScript**, light-themed, three views (Chat / Documents /
+  Chunks) instead of a single demo page.
+- **No external vector database.** Embeddings and the BM25 index live in an
+  in-memory read model (`SearchIndexService`) rebuilt from SQLite after every write.
+  See [Scaling](#scaling-thoughts) for what replaces this at real scale.
+- **No LLM/embedding/reranker API key.** All three are stubbed behind interfaces
+  (below) so the service is fully runnable offline and deterministically testable —
+  and, unlike a real model call, every stub decision is inspectable and explainable.
 
 ## Architecture
 
 ```
-docs/*.md
-    │
-    ▼
-IngestionService        — reads files, splits into section-level chunks (MarkdownChunker)
-    │
-    ▼
-IEmbeddingService        — embeds each chunk  (stub: HashingEmbeddingService)
-    │
-    ▼
-IKnowledgeStore          — in-memory chunk + embedding store (InMemoryKnowledgeStore)
-    │
-    ▼ (at query time)
-IRetrievalService         — embeds the question, cosine-similarity top-k over the store
-    │
-    ▼
-AskService                — confidence gate, then calls generation
-    │
-    ▼
-ILlmService                — grounded answer from the retrieved chunks (stub: ExtractiveStubLlmService)
-    │
-    ▼
-AskController /api/ask    — HTTP contract
+docs/*.md (first-run seed)          POST /api/documents (manual ingestion)
+        │                                       │
+        └───────────────┬───────────────────────┘
+                         ▼
+                 DocumentService
+      MarkdownChunker.Parse → section-level chunks
+      with exact char offsets into the source doc
+                         │
+                         ▼
+              IEmbeddingService.Embed (stub: HashingEmbeddingService)
+                         │
+                         ▼
+              SQLite (Documents, Chunks tables) ── source of truth
+                         │
+                         ▼ RefreshAsync() after every write
+              SearchIndexService (in-memory read model)
+              chunk list + Bm25Index, rebuilt from SQLite
+                         │
+        ┌────────────────┴────────────────┐
+        ▼ (at query time)                 ▼
+   Bm25Index.ScoreAll(query)      cosine similarity over embeddings
+   (keyword search)                (semantic search)
+        └────────────────┬────────────────┘
+                          ▼
+              Reciprocal Rank Fusion (RRF)
+                          ▼
+              IRerankerService (stub: HeuristicRerankerService)
+                          ▼
+              RagQueryService: confidence gate, then generation
+                          ▼
+              ILlmService (stub: ExtractiveStubLlmService)
+                          ▼
+        AskController /api/ask  ·  ChatController /api/chat (+ persistence)
 ```
 
-Ingestion, retrieval, and generation are separate interfaces/classes, each swappable
-independently:
+Every stage is a separately swappable interface:
 
-- `IEmbeddingService` — swap `HashingEmbeddingService` for an OpenAI/Azure
-  OpenAI/Anthropic-backed embedding client with no other code changes.
-- `ILlmService` — swap `ExtractiveStubLlmService` for a real chat-completion call
-  (same signature: question + retrieved chunks in, answer text out).
-- `IKnowledgeStore` — swap the in-memory store for a real vector store.
+| Interface | Stub implementation | Real swap |
+|---|---|---|
+| `IEmbeddingService` | `HashingEmbeddingService` (hashed bag-of-words) | OpenAI/Azure OpenAI/Anthropic embedding client |
+| `ILlmService` | `ExtractiveStubLlmService` (best-matching sentence) | Chat-completion call, prompted to answer only from context |
+| `IRerankerService` | `HeuristicRerankerService` (lexical-overlap + fused score) | Cohere Rerank / a BGE or ms-marco cross-encoder |
+| `ISearchIndexService` | In-memory, rebuilt from SQLite | pgvector / Azure AI Search / Cosmos DB vector search |
 
-### Chunking
+### Chunking and exact pinpoint
 
-`MarkdownChunker` splits each doc on `## ` headings, so each chunk is one coherent
-section (e.g. "Pricing Plans — Enterprise Plan") rather than an arbitrary fixed-size
-window. Sections longer than 120 words are further split with a 20-word sliding
-overlap so no single chunk grows unbounded. This is a deliberate trade: it relies on
-the sample docs being reasonably well-structured markdown, which is realistic for a
-docs corpus but wouldn't hold for unstructured plain text.
+`MarkdownChunker` splits each doc on `## ` headings (one chunk per coherent
+section), further splitting sections over 120 words with a 20-word overlap. Every
+chunk carries `StartChar`/`EndChar` offsets into the parent document's stored
+content, computed by tracking a cursor through the source text during parsing — not
+guessed after the fact. A citation's `startChar`/`endChar` slice the original
+document's `content` field exactly; this is verified in testing (see below). If a
+chunk is later hand-edited via the Chunks UI, its offsets reset to `-1`/`-1` rather
+than silently pointing at stale text.
 
-### Embedding stub
+### Hybrid retrieval: BM25 + semantic + RRF + rerank
 
-`HashingEmbeddingService` is a deterministic "hashing trick" bag-of-words vectorizer
-(2048 dims, FNV-1a hash, random-sign feature hashing, L2-normalized) — no model, no
-network call, same output every time for the same text. It's a legitimate lightweight
-IR technique (not just a random placeholder): texts sharing vocabulary land close
-together under cosine similarity, which is enough to demonstrate real retrieval
-behavior end to end. It is not as good as a real embedding model at handling synonyms
-or paraphrasing.
+Two independent rankers run per query:
 
-### Generation stub
+- **BM25** (`Bm25Index`, Okapi BM25, k1=1.5, b=0.75) — classic inverted-index keyword
+  search. Exact on terms; this is what catches a product name or error code that a
+  small hashed embedding can blur.
+- **Semantic** — cosine similarity over `HashingEmbeddingService` output.
 
-`ExtractiveStubLlmService` doesn't generate free text — it picks the sentence in the
-top-ranked chunk that shares the most words with the question. This guarantees the
-answer is a substring of retrieved source text (i.e., grounded by construction),
-which is the property a real LLM call has to be *prompted* for. Swapping in a real
-LLM would trade "guaranteed grounded" for "more natural language" and would need a
-prompt that explicitly instructs the model to answer only from the provided context
-and to say so when it can't.
+Their rankings are combined with **Reciprocal Rank Fusion**
+(`score = Σ 1/(k + rank + 1)`, k=60) — the same fusion technique Elasticsearch, Azure
+AI Search, and Weaviate use for hybrid search. RRF works on *ranks*, not raw scores,
+which sidesteps the fact that a BM25 score and a cosine similarity live on
+incompatible scales and can't be averaged directly.
+
+The fused candidate set is then **reranked** (`HeuristicRerankerService`) using the
+normalized fused score, lexical token overlap, and an exact-phrase-match bonus — a
+deterministic approximation of what a real cross-encoder reranker scores. The fused
+score is normalized against a fixed theoretical maximum (rank #1 in both rankers),
+not the batch's own min/max — an earlier version normalized per-batch and it broke
+the confidence signal: the best-of-a-bad-lot candidate always looked artificially
+confident. See [AI tooling disclosure](#ai-tooling-disclosure) for how that surfaced.
 
 ### Confidence / "no good answer" signal
 
-`AskService` uses the top-1 cosine similarity score as a confidence signal, gated at
-a threshold (`0.18`, tuned empirically against the sample corpus — see
-`AskService.ConfidenceThreshold`). Below the threshold, the endpoint returns
-`noConfidentAnswer: true` with no citations instead of forcing an answer from
-irrelevant chunks.
+The top reranked candidate's score (0–1) is gated at `ConfidenceThreshold = 0.35` in
+`RagQueryService`, tuned empirically: grounded queries against the sample corpus
+score 0.55–0.78, nonsense queries score ~0.25. Below the threshold, `/api/ask` and
+`/api/chat` return `noConfidentAnswer: true` with no citations rather than forcing an
+answer.
 
 ## API contract
 
-`POST /api/ask`
+**Q&A**
 
-```json
-// request
-{ "question": "How much does the Business plan cost per month?", "topK": 3 }
+- `POST /api/ask` `{ question, topK? }` → `{ question, answer, citations[], confidence, noConfidentAnswer }`. Stateless, no conversation persisted.
+- `POST /api/chat` `{ message, topK? }` → starts a new conversation; same shape wrapped as `{ conversationId, userMessage, assistantMessage }`.
+- `POST /api/chat/{conversationId}` — continues an existing conversation. `404` if it doesn't exist.
+- `GET /api/chat` → list conversations (id, message count, last-message preview).
+- `GET /api/chat/{conversationId}` → full message history.
 
-// response (200)
-{
-  "question": "How much does the Business plan cost per month?",
-  "answer": "Aurora Cloud Storage - Pricing Plans — Business Plan\nThe Business plan costs $49 per month... (from \"Aurora Cloud Storage - Pricing Plans\")",
-  "citations": [
-    { "docId": "pricing", "docTitle": "Aurora Cloud Storage - Pricing Plans", "snippet": "...", "score": 0.48 }
-  ],
-  "confidence": 0.48,
-  "noConfidentAnswer": false
-}
-```
+Each `citation` includes `docId`, `docTitle`, `chunkId`, `heading`, `snippet`,
+`startChar`/`endChar` (exact pinpoint, `-1` if stale), and the full score breakdown:
+`bm25Score`, `semanticScore`, `rerankScore`.
 
-- `400 Bad Request` — empty/missing `question`.
-- `200` with `noConfidentAnswer: true` and an empty `citations` array — retrieval
-  score too low to ground an answer (this is a normal outcome, not an error, so it's
-  still a 200).
+**Documents** (`/api/documents`)
 
-`GET /api/docs` — lists ingested document titles and chunk count; used by the demo UI
-to show what's indexed.
+- `GET /` — list (title, chunk count, source type, timestamps).
+- `GET /{id}` — full detail including content and all chunks.
+- `POST /` `{ title, content }` — chunks, embeds, and indexes immediately. `201`.
+- `PUT /{id}` `{ title, content }` — replaces all chunks and re-embeds. `200`/`404`.
+- `DELETE /{id}` — cascades to chunks. `204`/`404`.
+
+**Chunks** (`/api/chunks`)
+
+- `GET /?documentId=` — list, optionally filtered.
+- `GET /{id}` — single chunk.
+- `PUT /{id}` `{ text }` — re-embeds just this chunk; resets its offsets to `-1`/`-1`.
+- `DELETE /{id}`.
+
+All mutating endpoints return `400` on missing required fields.
 
 ## Running it
 
 Requires .NET 8 SDK and Node 18+.
 
 ```bash
-# API — runs on http://localhost:5252, ingests /docs at startup
+# API — http://localhost:5252. Creates rag.db and seeds /docs on first run only.
 cd server
 dotnet run
 
-# Client — runs on http://localhost:5173
+# Client — http://localhost:5173
 cd client
 npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`, use one of the sample-question chips, or type your own.
+Open `http://localhost:5173`. **Chat** answers questions with citations and scores.
+**Documents** lists/adds/edits/deletes source documents (editing re-chunks and
+re-embeds). **Chunks** browses/edits/deletes individual indexed chunks, filterable
+by document.
+
+To reset to a clean seeded state: stop the server, delete `server/rag.db*`, restart.
 
 ## Verifying the definition of done
 
-Three grounded questions and one nonsense query, run against `/api/ask`:
+Four questions run against `/api/ask` (see [AI tooling disclosure](#ai-tooling-disclosure)
+for how the confidence threshold was actually tuned, not just asserted):
 
 | Question | Confidence | Result |
 |---|---|---|
-| "How much does the Business plan cost per month?" | 0.48 | Grounded answer, cites `pricing` |
-| "How long until deleted files are permanently purged?" | 0.24 | Grounded answer, cites `security` |
-| "What is the response time for Enterprise support?" | 0.48 | Grounded answer, cites `support-hours` |
-| "What is the airspeed velocity of an unladen swallow?" | 0.07 | `noConfidentAnswer: true`, no citations |
+| "How much does the Business plan cost per month?" | 0.68 | Grounded, cites `pricing`, BM25 6.85 / semantic 0.48 |
+| "How long until deleted files are permanently purged?" | 0.70 | Grounded, cites `security` |
+| "What is the response time for Enterprise support?" | 0.78 | Grounded, cites `support-hours` |
+| "What is the airspeed velocity of an unladen swallow?" | 0.25 | `noConfidentAnswer: true`, no citations |
+
+Also verified: citation `startChar`/`endChar` slice the exact cited text out of the
+document's stored content (not just "somewhere in this doc"); document create/edit
+immediately affects retrieval with no restart; chunk edit re-embeds and flips its
+offsets to stale; document delete cascades and removes it from retrieval; multi-turn
+chat persists and reloads correctly; all four browser-driven flows (chat, add
+document, filter/edit chunk) verified with zero console errors via a scripted
+Playwright pass, screenshotted at each step.
+
+## Known limitations
+
+Being direct about what's still a stub, since the challenge asks for exactly that:
+
+- **Hashed embeddings have no real semantics.** `HashingEmbeddingService` is a
+  hashed bag-of-words — it catches vocabulary overlap, not meaning. Concretely: after
+  deleting a "Mobile App / Offline Access" document, asking about mobile offline
+  storage still returned a *plausible-looking but wrong* answer (confidence 0.56,
+  above threshold) grounded in a Pricing chunk, because "storage" and "device" appear
+  in both. A real embedding model would separate these; no threshold on this stub can
+  fully fix it, since the false positive's score overlaps the true-positive range.
+- **The reranker and LLM are heuristics, not learned models.** They're deterministic
+  and explainable by design, but a real cross-encoder and a real LLM call would both
+  meaningfully outperform them on paraphrase and multi-hop questions.
+- **Full index rebuild on every write.** `SearchIndexService.RefreshAsync()` reloads
+  every chunk from SQLite and rebuilds BM25 from scratch after each create/update/
+  delete. Fine at this corpus size; not how you'd do it past a few thousand chunks.
+- **No multi-turn context fusion.** Each chat message is answered independently — a
+  follow-up like "what about the Starter plan?" only works because it happens to be a
+  complete question on its own, not because prior turns are folded into retrieval.
+- **No auth/multi-tenancy.** Anyone hitting the API can read/write any document.
 
 ## Scaling thoughts
 
-For a demo corpus of ~26 chunks, brute-force in-memory cosine similarity is O(n) per
-query and effectively instant. That stops being true well before a real knowledge
-base's size:
-
-- **Low thousands of chunks**: still fine in-memory, but should move out of process
-  (a stateless API replica would otherwise re-ingest and re-embed on every restart) —
-  persist chunks + embeddings in SQL Server/Postgres and rebuild the in-memory index
-  from there on boot.
-- **Tens of thousands+**: swap `IKnowledgeStore` for a real vector index —
-  **pgvector** (if already on Postgres), **Azure AI Search** (native fit for an
-  Azure-hosted .NET API, supports hybrid keyword+vector search and metadata
-  filtering), or **Azure SQL/SQL Server's newer vector type** to stay on the
-  suggested stack. Any of these swap in behind the existing `IKnowledgeStore`
-  interface without touching ingestion, retrieval orchestration, or the API contract.
-- **Embeddings**: swap the hashing stub for a real embedding model behind
-  `IEmbeddingService` — this is the single highest-value upgrade, since hashed
-  bag-of-words has no notion of synonyms or semantic similarity.
-- **Re-ingestion**: currently a full re-ingest on process startup. At real scale this
-  becomes an incremental pipeline (hash each doc, only re-embed changed docs) rather
-  than a full rebuild.
+- **Vector search**: swap `ISearchIndexService`'s embedding-similarity half for
+  **pgvector** (if already on Postgres) or **Azure AI Search** (native fit for an
+  Azure-hosted .NET API — also supports hybrid keyword+vector search server-side,
+  which would let BM25 + semantic fusion move out of process too).
+- **Keyword search**: past a few thousand chunks, `Bm25Index`'s in-memory inverted
+  index should become **Elasticsearch/OpenSearch** or Azure AI Search's built-in BM25,
+  both of which also solve incremental indexing (this app currently does a full
+  rebuild per write).
+- **Embeddings**: swap `HashingEmbeddingService` for a real model — the single
+  highest-value upgrade, since it's the root cause of every retrieval-quality issue
+  found during testing.
+- **Reranking**: swap `HeuristicRerankerService` for Cohere Rerank or a hosted
+  cross-encoder; the interface contract (query + candidates in, scored+ordered list
+  out) doesn't change.
+- **Persistence**: SQLite → SQL Server/Postgres is a one-line connection-string
+  change in `Program.cs`; the EF Core model doesn't reference anything SQLite-specific.
 
 ## What I'd improve with more time
 
-- Replace the hashing embedding stub with a real embedding model (OpenAI
-  `text-embedding-3-small` or similar) — the interface is already there.
-- Replace the extractive answer stub with an actual LLM call, prompted to answer only
-  from provided context and to explicitly decline when context is insufficient.
-- Chunk-level citation highlighting in the UI (currently shows the whole matched
-  snippet, not the specific sentence used).
-- Basic retrieval evals: a small fixed set of question → expected-doc-ID pairs run as
-  an automated test, so chunking/embedding changes can't silently regress retrieval.
-- Hybrid retrieval (keyword/BM25 + vector) — the hashing stub is weak on exact-term
-  matches (e.g., product names) that a keyword pass would catch reliably.
-- Persist the index (SQL Server) instead of re-ingesting from disk on every restart.
+- Real embedding model + real LLM call + real reranker behind the existing interfaces.
+- A small fixed retrieval eval set (question → expected doc/chunk ID) run as an
+  automated test, so future chunking/scoring changes can't silently regress quality.
+- Multi-turn context fusion for chat (fold recent turns into the retrieval query).
+- Incremental index updates instead of full rebuild-on-write.
+- Basic auth and per-document soft-delete/versioning instead of hard delete.
 
 ## AI tooling disclosure
 
-Built with Claude Code (Sonnet 5), which wrote the ingestion/retrieval/generation
-services, the controllers, and the React client based on my direction on
-architecture and tradeoffs (in-memory store vs. real vector DB, hashing-trick stub
-vs. leaving embeddings unimplemented, extractive vs. templated stub answers,
-section-based vs. fixed-window chunking).
+Built with Claude Code (Sonnet 5), which wrote the service/controller/UI code based
+on my direction on architecture (hybrid retrieval design, persistence model, stub
+boundaries, chunking strategy).
 
-What I verified by hand: read every file end to end; ran the API and hit `/api/ask`
-directly with `curl` for the three grounded questions and three different nonsense
-queries to confirm the confidence threshold actually separates them (initially it
-didn't — the first hashing-embedding dimension size and threshold let a "tell me a
-joke about cats" query through as a false positive, so we increased the embedding
-dimensionality and re-tuned the threshold against real output rather than guessing);
-drove the running client through Playwright to confirm both the grounded-answer and
-no-confident-answer UI states render correctly with zero console errors.
+What I verified by hand, including bugs actually caught during that verification
+(not just "I ran it once and it looked fine"):
 
-With another 2 hours: real embeddings + real LLM call behind the existing
-interfaces, a retrieval eval test, and hybrid keyword+vector search.
+- **Chunker offset overflow**: the char-offset cursor assumed every line was
+  followed by `\n`, which is false for a file's last line — crashed on startup until
+  caught by actually running the seed and reading the stack trace.
+- **Reranker confidence bug**: normalizing the fused BM25+semantic score against the
+  candidate *batch's* own min/max meant the best candidate in any batch always scored
+  ≈1.0 — so a nonsense query still returned a "confident" answer. Caught by testing a
+  deliberately irrelevant query ("tell me a joke about cats") against the running
+  API, not by inspection. Fixed by normalizing against a fixed theoretical maximum
+  instead.
+- **Extractive-answer bug**: the stub answer generator scored sentences including the
+  `"Title — Heading\n"` prefix baked into each chunk's text, so heading keywords
+  leaked into scoring and could outrank the actually-relevant sentence. Caught by
+  asking a specific numeric question ("how much offline storage per device") and
+  noticing the returned sentence didn't contain the number.
+- Every CRUD endpoint exercised directly via `curl` (create/update/delete documents
+  and chunks, cascade deletes, 400/404 paths, multi-turn chat persistence).
+- Full UI verified in an actual browser via a scripted Playwright pass (not just
+  "it compiles") across all three tabs, with `console --errors` checked at each step
+  and screenshots captured.
+
+With another 2 hours: real embeddings behind `IEmbeddingService` first, since that's
+the one stub whose limitations showed up repeatedly during testing.
