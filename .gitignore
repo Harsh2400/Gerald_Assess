@@ -1,0 +1,10 @@
+# .NET
+server/bin/
+server/obj/
+
+# Node
+client/node_modules/
+client/dist/
+
+# OS
+.DS_Store
