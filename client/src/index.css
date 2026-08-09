@@ -17,3 +17,30 @@
 @media(max-width:1180px){.page-frame{padding:0}.app-shell{border:0;border-radius:0;grid-template-columns:190px minmax(0,.92fr) minmax(0,1.08fr)}.manager-view{padding:28px 20px}.assistant-header{padding:0 20px}.chat-messages{padding:24px 20px}.chat-composer{padding-inline:18px}}
 @media(max-width:900px){.app-shell{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) 62px}.main-sidebar{display:none}.workspace-pane,.assistant-pane{display:none;grid-row:1;min-width:0;max-width:100%;border:0;overflow:auto}.workspace-pane.mobile-active,.assistant-pane.mobile-active{display:block}.mobile-nav{grid-row:2;display:flex;background:#fff;border-top:1px solid var(--line);z-index:20}.mobile-nav button{width:50%;border:0;background:#fff;color:#999;display:flex;align-items:center;justify-content:center;gap:7px;font-size:11px}.mobile-nav button.active{color:#29282e}.spark-icon{font-size:17px}.assistant-pane.mobile-active{height:100%;overflow:hidden}.manager-view{padding:24px 16px}.manager-header{align-items:center}.upload-zone{min-height:135px}.data-table th:nth-child(3),.data-table td:nth-child(3),.data-table th:nth-child(4),.data-table td:nth-child(4){display:none}}
 @media(max-width:480px){.manager-header p{display:none}.manager-header{gap:10px}.manager-header h2{font-size:18px}.manager-header .btn{white-space:nowrap}.upload-zone small{max-width:260px;line-height:1.4}.upload-helper{align-items:flex-start;flex-direction:column}.table-card{overflow-x:auto;max-width:100%}.data-table{width:100%;table-layout:fixed}.data-table th:last-child,.data-table td:last-child{width:104px}.row-title{min-width:0}.row-title>span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis}.assistant-header{height:67px;flex-basis:67px;padding:0 16px}.chat-messages{padding:18px 14px}.message-row.assistant{padding-right:0}.message-row.user{padding-left:8%}}
+
+/* Keep long conversations inside the viewport. Every parent in this chain must
+   allow its flex/grid child to shrink, otherwise the page itself grows and the
+   fixed composer is pushed below the screen. */
+html,body,#root,.page-frame,.app-shell{min-height:0;overflow:hidden}
+.app-shell{grid-template-rows:minmax(0,1fr)}
+.workspace-pane,.assistant-pane{min-height:0;height:100%}
+.assistant-pane,.chat-main{overflow:hidden}
+.chat-main{min-height:0}
+.chat-messages{flex:1 1 0;height:0;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+
+/* Data grids live in a narrow split pane. Scroll the grid horizontally instead
+   of clipping its action columns, and scroll the knowledge pane vertically. */
+.workspace-pane{overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.table-card{display:block;width:100%;max-width:100%;overflow-x:auto;overflow-y:hidden;overscroll-behavior-inline:contain;scrollbar-gutter:stable;scrollbar-width:thin}
+.documents-table-card .data-table{min-width:680px}
+.chunks-table-card .data-table{min-width:900px}
+.documents-table-card .data-table th:first-child,.documents-table-card .data-table td:first-child{min-width:210px}
+.chunks-table-card .data-table th:nth-child(1),.chunks-table-card .data-table td:nth-child(1){width:210px;min-width:210px}
+.chunks-table-card .data-table th:nth-child(2),.chunks-table-card .data-table td:nth-child(2){width:130px;min-width:130px}
+.chunks-table-card .data-table th:nth-child(3),.chunks-table-card .data-table td:nth-child(3){width:330px;min-width:330px}
+.chunks-table-card .data-table th:nth-child(4),.chunks-table-card .data-table td:nth-child(4){width:100px;min-width:100px}
+.data-table th{position:sticky;top:0;z-index:1}
+.table-card::-webkit-scrollbar,.workspace-pane::-webkit-scrollbar,.chat-messages::-webkit-scrollbar{width:9px;height:9px}
+.table-card::-webkit-scrollbar-thumb,.workspace-pane::-webkit-scrollbar-thumb,.chat-messages::-webkit-scrollbar-thumb{background:#cbc8cc;border:2px solid transparent;border-radius:999px;background-clip:padding-box}
+.table-card::-webkit-scrollbar-track,.workspace-pane::-webkit-scrollbar-track,.chat-messages::-webkit-scrollbar-track{background:transparent}
+@media(max-width:900px){.documents-table-card .data-table{min-width:600px}.chunks-table-card .data-table{min-width:560px}.chunks-table-card .data-table th:nth-child(1),.chunks-table-card .data-table td:nth-child(1){width:210px}.chunks-table-card .data-table th:nth-child(2),.chunks-table-card .data-table td:nth-child(2){width:140px}}

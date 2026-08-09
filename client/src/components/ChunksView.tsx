@@ -95,7 +95,7 @@ export function ChunksView({
         ) : chunks.length === 0 ? (
           <div className="empty-state">No chunks found.</div>
         ) : (
-          <div className="table-card"><table className="data-table">
+          <div className="table-card chunks-table-card"><table className="data-table">
             <thead>
               <tr>
                 <th>Document</th>

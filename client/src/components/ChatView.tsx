@@ -23,10 +23,17 @@ export function ChatView() {
   const [error, setError] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
 
   const refreshConversations = () => api.listConversations().then(setConversations).catch(() => {});
   useEffect(() => { refreshConversations(); }, []);
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, loading]);
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const container = messagesRef.current;
+      if (container) container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [messages, loading]);
 
   async function loadConversation(id: string) {
     setError(null);
@@ -74,7 +81,7 @@ export function ChatView() {
         )}
       </header>
 
-      <div className="chat-messages">
+      <div className="chat-messages" ref={messagesRef}>
         {messages.length === 0 && (
           <div className="chat-intro">
             <div className="intro-orb">✦</div>

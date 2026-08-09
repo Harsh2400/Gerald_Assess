@@ -39,7 +39,6 @@ function App() {
           <nav className="side-nav">
             <button className={view === 'documents' ? 'active' : ''} onClick={showDocuments}><Icon name="home"/>Overview</button>
             <button onClick={() => showChunks()} className={view === 'chunks' && !chunksFilterDocId ? 'active' : ''}><Icon name="chunks"/>All chunks</button>
-            <button className="disabled-nav" title="Single-user local workspace"><Icon name="team"/>Team<span>Soon</span></button>
           </nav>
 
           <div className="nav-label projects-label">Knowledge base</div>

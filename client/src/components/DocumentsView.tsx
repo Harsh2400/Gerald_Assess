@@ -156,7 +156,7 @@ export function DocumentsView({ onViewChunks }: { onViewChunks: (documentId: str
         ) : documents.length === 0 ? (
           <div className="empty-state">No documents yet. Add one to get started.</div>
         ) : (
-          <div className="table-card"><table className="data-table">
+          <div className="table-card documents-table-card"><table className="data-table">
             <thead>
               <tr>
                 <th>Title</th>
